@@ -14,6 +14,24 @@ public enum PanDirection {
     case Down
 }
 
+@inline(__always)
+func fequal(a: Double, _ b: Double) -> Bool
+{
+    return a - b < DBL_EPSILON
+}
+
+@inline(__always)
+func fequalzero(a: Double) -> Bool
+{
+    return a < DBL_EPSILON
+}
+
+@inline(__always)
+func flessthan(a: Double, _ b: Double) -> Bool
+{
+    return a < b + DBL_EPSILON
+}
+
 public let defaultFollowScrollThreshDown: Double = 500
 
 public let defaultMinHeight: CGFloat = 0
@@ -28,6 +46,7 @@ public class MCDNavigationBar: UINavigationBar, UIGestureRecognizerDelegate {
         willSet {
             if let s = self.scrollView {
                 s.removeGestureRecognizer(self.panRecognizer!)
+                s.removeObserver(self, forKeyPath: "contentOffset")
 
                 let newToken: dispatch_once_t = 0
                 captureHeightToken = newToken
@@ -40,6 +59,7 @@ public class MCDNavigationBar: UINavigationBar, UIGestureRecognizerDelegate {
             self.panRecognizer = UIPanGestureRecognizer(target: self, action: #selector(MCDNavigationBar.panMonitor))
             self.panRecognizer?.delegate = self
             s.addGestureRecognizer(self.panRecognizer!)
+            s.addObserver(self, forKeyPath: "contentOffset", options: [.Old, .New], context: nil)
         }
     }
 
@@ -67,11 +87,22 @@ public class MCDNavigationBar: UINavigationBar, UIGestureRecognizerDelegate {
     }
 
     func panMonitor(sender: UIPanGestureRecognizer) {
-        let translation = sender.translationInView(self.scrollView!)
-        let velocity = sender.velocityInView(self.scrollView!)
-        panRecognizer!.setTranslation(translation, inView: self.scrollView!)
+        let velocity = panRecognizer!.velocityInView(self.scrollView!)
 
-        panDirection = velocity.y > 0 ? .Down : .Up
+        let hide = {
+            var frame = self.frame
+            frame.size.height = self.minHeight
+            UIView.animateWithDuration(0.2, animations: {
+                self.frame = frame
+            })
+        }
+        let show = {
+            var frame = self.frame
+            frame.size.height = self.initialHeight
+            UIView.animateWithDuration(0.2, animations: {
+                self.frame = frame
+            })
+        }
 
         if sender.state == .Began {
             dispatch_once(&captureHeightToken, {
@@ -81,84 +112,64 @@ public class MCDNavigationBar: UINavigationBar, UIGestureRecognizerDelegate {
 
                 self.scrollViewHideNavOffsetY = self.initialHeight / self.deltaYRate
             })
-        } else if sender.state == .Changed {
-            if panDirection == .Up {
-                needFollow = true
-            } else {
-                needFollow = scrollView!.contentOffset.y <= self.scrollViewHideNavOffsetY
-            }
-
-            var frame = self.frame
-
-            let isMinHeight = frame.size.height == minHeight
-            let isDirectionUp = panDirection == .Up
-            let isScrollViewOverDown = scrollView!.contentOffset.y <= initialScrollViewContentOffsetY
-            let isMaxHeight = frame.size.height == initialHeight
-            let isDirectionDown = panDirection == .Down
-
-            if !needFollow {
-                previousPanTranslation = translation
-                return
-            }
-
-            if isMinHeight && isDirectionUp || isScrollViewOverDown || isMaxHeight && isDirectionDown {
-                return
-            }
-
-            let diff = translation.y - previousPanTranslation.y
-            let delta = deltaYRate * abs(diff)
-
-            if panDirection == .Up {
-                frame.size.height -= delta
-            } else {
-                frame.size.height += delta
-            }
-
-            if frame.size.height > initialHeight {
-                frame.size.height = initialHeight
-            } else if frame.size.height < minHeight {
-                frame.size.height = minHeight
-            }
-
-            frame.origin.y = initialOriginY
-            self.frame = frame
-
-            previousPanTranslation = translation
-        } else if sender.state == .Ended {
-            previousPanTranslation = CGPointZero
-            needFollow = false
-
-            let hide = {
-                var frame = self.frame
-                frame.size.height = self.minHeight
-                UIView.animateWithDuration(0.2, animations: {
-                    self.frame = frame
-                })
-            }
-            let show = {
-                var frame = self.frame
-                frame.size.height = self.initialHeight
-                UIView.animateWithDuration(0.2, animations: {
-                    self.frame = frame
-                })
-            }
-
-            let offsetY = scrollView!.contentOffset.y
-
-            if panDirection == .Up {
-                if offsetY < 0 && offsetY > initialScrollViewContentOffsetY {
-                    show()
-                } else {
+        } else if panRecognizer?.state == .Ended {
+            let height = self.frame.size.height
+            if panDirection == .Down && abs(velocity.y) > CGFloat(followScrollThreshDown) {
+                show()
+            } else if height < initialHeight * 0.8 {
+                if scrollView!.contentOffset.y > 0 {
                     hide()
-                }
-            } else if panDirection == .Down {
-                if frame.size.height > initialHeight * 0.3 || abs(Double(velocity.y)) > followScrollThreshDown
-                || offsetY < 0 && offsetY > initialScrollViewContentOffsetY {
-                    show()
                 } else {
-                    hide()
+                    show()
                 }
+            } else {
+                show()
             }
         }
+    }
+
+    public override func observeValueForKeyPath(keyPath: String?, ofObject object: AnyObject?, change: [String: AnyObject]?,
+        context: UnsafeMutablePointer<Void>)
+    {
+        let velocity = panRecognizer!.velocityInView(self.scrollView!)
+        panDirection = velocity.y > 0 ? .Down : .Up
+
+        if panRecognizer?.state != .Changed {
+            return
+        }
+
+        guard let old = change![NSKeyValueChangeOldKey] as? NSValue else {
+            return
+        }
+        guard let new = change![NSKeyValueChangeNewKey] as? NSValue else {
+            return
+        }
+
+        let oldValue = old.CGPointValue()
+        let newValue = new.CGPointValue()
+
+        let diff = 0.8 * abs(newValue.y - oldValue.y)
+
+        var frame = self.frame
+        frame.origin.y = initialOriginY
+
+        if velocity.y > 0 {
+            if panRecognizer?.state == .Ended && velocity.y > CGFloat(followScrollThreshDown) || newValue.y < 0 {
+                frame.size.height += diff
+            }
+        } else {
+            if flessthan(Double(newValue.y), 0) && flessthan(Double(newValue.y), Double(initialScrollViewContentOffsetY)) {
+                return
+            }
+            frame.size.height -= diff
+        }
+
+        if frame.size.height > initialHeight {
+            frame.size.height = initialHeight
+        } else if frame.size.height < minHeight {
+            frame.size.height = minHeight
+        }
+
+        self.frame = frame
     }
 }
